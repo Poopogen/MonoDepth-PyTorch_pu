@@ -51,7 +51,7 @@ class MonodepthLoss(nn.modules.Module):
         flow_field = torch.stack((x_base + x_shifts, y_base), dim=3)
         # In grid_sample coordinates are assumed to be between -1 and 1
         output = F.grid_sample(img, 2*flow_field - 1, mode='bilinear',
-                               padding_mode='zeros')
+                               padding_mode='zeros', align_corners=True)#pu add  align_corners=True
 
         return output
 

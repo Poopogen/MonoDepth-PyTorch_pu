@@ -1,6 +1,7 @@
 import argparse
 import time
 import torch
+from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 import torch.optim as optim
 
@@ -8,6 +9,9 @@ import torch.optim as optim
 
 from loss import MonodepthLoss
 from utils import get_model, to_device, prepare_dataloader
+from log_output import tflog2pandas
+
+from easydict import EasyDict as edict
 
 # plot params
 
@@ -121,14 +125,20 @@ class Model:
 
     def __init__(self, args):
         self.args = args
+        ## tensorboard #pu
+        self.logger = SummaryWriter(args.output_directory)
 
         # Set up model
         self.device = args.device
         self.model = get_model(args.model, input_channels=args.input_channels, pretrained=args.pretrained)
-        self.model = self.model.to(self.device)
+        print('torch.cuda.device_count(): ',torch.cuda.device_count())#pu
         if args.use_multiple_gpu:
+            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'#pu
+            print('self.device',self.device)
             self.model = torch.nn.DataParallel(self.model)
-
+        
+        self.model = self.model.to(self.device)
+        
         if args.mode == 'train':
             self.loss_function = MonodepthLoss(
                 n=4,
@@ -136,6 +146,7 @@ class Model:
                 disp_gradient_w=0.1, lr_w=1).to(self.device)
             self.optimizer = optim.Adam(self.model.parameters(),
                                         lr=args.learning_rate)
+            print('Getting Val_loader... ')
             self.val_n_img, self.val_loader = prepare_dataloader(args.val_data_dir, args.mode,
                                                                  args.augment_parameters,
                                                                  False, args.batch_size,
@@ -151,7 +162,7 @@ class Model:
         self.output_directory = args.output_directory
         self.input_height = args.input_height
         self.input_width = args.input_width
-
+        print('Getting Loader... ')
         self.n_img, self.loader = prepare_dataloader(args.data_dir, args.mode, args.augment_parameters,
                                                      args.do_augmentation, args.batch_size,
                                                      (args.input_height, args.input_width),
@@ -181,6 +192,7 @@ class Model:
 
         running_val_loss /= self.val_n_img / self.args.batch_size
         print('Val_loss:', running_val_loss)
+        self.logger.add_scalar('val_loss_before_training', running_val_loss, 0)
 
         for epoch in range(self.args.epochs):
             if self.args.adjust_lr:
@@ -192,7 +204,7 @@ class Model:
             for data in self.loader:
                 # Load data
                 data = to_device(data, self.device)
-                left = data['left_image']
+                left = data['left_image'] # b,c,h,w
                 right = data['right_image']
 
                 # One optimization iteration
@@ -205,39 +217,60 @@ class Model:
 
                 # Print statistics
                 if self.args.print_weights:
-                    j = 1
+                    # print(self.model.named_parameters)
+                    import math
+                    p=0
                     for (name, parameter) in self.model.named_parameters():
                         if name.split(sep='.')[-1] == 'weight':
-                            plt.subplot(5, 9, j)
-                            plt.hist(parameter.data.view(-1))
+                            p+=1
+                    # print(p, 'and',math.ceil(p/5))
+                    j = 1
+                    
+                    plt.figure()
+                    for (name, parameter) in self.model.named_parameters():
+                        # print('name:',name)
+                        
+                        if name.split(sep='.')[-1] == 'weight':##
+                            #plt.subplot(5, 9, j)
+                            plt.subplot(5,math.ceil(p/5),j)#pu
+                            plt.hist(parameter.data.cpu().view(-1))#pu
                             plt.xlim([-1, 1])
                             plt.title(name.split(sep='.')[0])
                             j += 1
-                    plt.show()
+                    #plt.show()
+                    plt.savefig('print_weights.jpg')
 
                 if self.args.print_images:
                     print('disp_left_est[0]')
+                    plt.figure()
                     plt.imshow(np.squeeze(
                         np.transpose(self.loss_function.disp_left_est[0][0,
                                      :, :, :].cpu().detach().numpy(),
                                      (1, 2, 0))))
-                    plt.show()
+                    #plt.show()
+                    plt.savefig('disp_left_est[0].jpg')
                     print('left_est[0]')
+                    plt.figure()
                     plt.imshow(np.transpose(self.loss_function\
                         .left_est[0][0, :, :, :].cpu().detach().numpy(),
                         (1, 2, 0)))
-                    plt.show()
+                    #plt.show()
+                    plt.savefig('left_est[0].jpg')
                     print('disp_right_est[0]')
+                    plt.figure()
                     plt.imshow(np.squeeze(
                         np.transpose(self.loss_function.disp_right_est[0][0,
                                      :, :, :].cpu().detach().numpy(),
                                      (1, 2, 0))))
-                    plt.show()
+                    #plt.show()
+                    plt.savefig('disp_right_est[0].jpg')
                     print('right_est[0]')
+                    plt.figure()
                     plt.imshow(np.transpose(self.loss_function.right_est[0][0,
                                :, :, :].cpu().detach().numpy(), (1, 2,
                                0)))
-                    plt.show()
+                    #plt.show()
+                    plt.savefig('right_est[0].jpg')
                 running_loss += loss.item()
 
             running_val_loss = 0.0
@@ -265,13 +298,18 @@ class Model:
                 round(time.time() - c_time, 3),
                 's',
                 )
+            self.logger.add_scalar('train_loss', running_loss, epoch+ 1)
+            self.logger.add_scalar('val_loss', running_val_loss, epoch+ 1)
+            self.logger.add_scalar('time(s)', round(time.time() - c_time, 3), epoch+ 1)
+
             self.save(self.args.model_path[:-4] + '_last.pth')
             if running_val_loss < best_val_loss:
                 self.save(self.args.model_path[:-4] + '_cpt.pth')
                 best_val_loss = running_val_loss
                 print('Model_saved')
-
+        self.logger.add_scalar('best_val_loss', best_val_loss, 0)
         print ('Finished Training. Best loss:', best_loss)
+        tflog2pandas(self.output_directory)
         self.save(self.args.model_path)
 
     def save(self, path):
@@ -300,10 +338,13 @@ class Model:
                 disparities_pp[i] = \
                     post_process_disparity(disps[0][:, 0, :, :]\
                                            .cpu().numpy())
+                if i%10==0:
+                    np.save(self.output_directory + '/disparities_%i.npy'%i, disparities[i])
+                    np.save(self.output_directory + '/disparities_pp_%i.npy'%i,
+                            disparities_pp[i])
+                    np.save(self.output_directory + '/original_%i.npy'%i,
+                            data.cpu().numpy())
 
-        np.save(self.output_directory + '/disparities.npy', disparities)
-        np.save(self.output_directory + '/disparities_pp.npy',
-                disparities_pp)
         print('Finished Testing')
 
 
@@ -318,5 +359,49 @@ def main(args):
 
 
 if __name__ == '__main__':
-    main()
+    # main() ##pu
 
+    dict_parameters = edict({'data_dir':'data/eye_original_frames_fps2_final/train/',#'data/kitti/train/'
+                         'val_data_dir':'data/eye_original_frames_fps2_final/val/',
+                         'model_path':'data/models/monodepth1_eyefp2_resnet18_20240607.pth',
+                         'output_directory':'data/output/',
+                         'input_height':256,
+                         'input_width':512,
+                         'model':'resnet18_md',#resnet50_md
+                         'pretrained':False,#True
+                         'mode':'train',
+                         'epochs':500,#200s
+                         'learning_rate':1e-4,
+                         'batch_size': 32,#default 256#8
+                         'adjust_lr':True,
+                         'device':'cuda:0',
+                         'do_augmentation':True,
+                         'augment_parameters':[0.8, 1.2, 0.5, 2.0, 0.8, 1.2],
+                         'print_images':False,
+                         'print_weights':False,
+                         'input_channels': 3,
+                         'num_workers': 4,#8
+                         'use_multiple_gpu':True })#False
+
+    dict_parameters_test = edict({'data_dir':'data/eye_original_frames_fps2_final/val',
+                              'model_path':'data/models/monodepth1_eyefp2_resnet18_20240607_cpt.pth',
+                              'output_directory':'data/output/',
+                              'input_height':256,
+                              'input_width':512,
+                              'model':'resnet18_md',
+                              'pretrained':False,
+                              'mode':'test',
+                              'device':'cuda:0',
+                              'input_channels':3,
+                              'num_workers':4,
+                              'use_multiple_gpu':True})  
+    # model = Model(dict_parameters)
+    # model.train() 
+    model_test = Model(dict_parameters_test)
+    model_test.test()             
+
+    # if dict_parameters.mode == 'train':
+    #     model = Model(dict_parameters)
+    #     model.train()
+    # elif dict_parameters.mode == 'test':
+    #     

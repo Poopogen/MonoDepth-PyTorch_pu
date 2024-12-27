@@ -2,3 +2,6 @@
 __pycache__/
 .idea
 data
+*.jpg
+*.txt
+*.sh
